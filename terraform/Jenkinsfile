@@ -1,0 +1,116 @@
+pipeline {
+    agent any
+
+    parameters {
+        choice(name: 'ACTION', choices: ['plan', 'apply', 'destroy'], description: 'Choose the terraform action to run')
+        string(name: 'BRANCH', defaultValue: 'main', description: 'Git Branch to deploy from')
+        choice(name: 'EnvToDeploy', choices: ['ecs-dev', 'ecs-qa', 'ecs-prod'], description: 'Environment to deploy')
+    }
+
+    environment {
+        TF_DIR = 'terraform'
+        TF_CLOUD_TOKEN = credentials('TF_CLOUD_TOKEN')
+    }
+
+    stages {
+        stage('Clone Github repo') {
+            steps {
+                git url: 'https://github.com/Kunal-Jain7/mtc-terraform.git', branch: "${params.BRANCH}"
+            }
+        }
+
+        stage('Initializing Terraform') {
+            steps {
+                withAWS(credentials: 'aws_creds') {
+                    dir("${env.TF_DIR}") {
+                        sh "export TF_TOKEN_app_terraform_io=${TF_CLOUD_TOKEN}"
+                        sh "terraform init -input=false -no-color"
+                        sh "terraform workspace select ${EnvToDeploy} || terraform workspace new ${EnvToDeploy}"
+                    }
+                }
+            }
+        }
+        stage('Terraform Plan') {
+            steps {
+                withAWS(credentials: 'aws_creds') {
+                    dir("${env.TF_DIR}") {
+                        sh "export TF_TOKEN_app_terraform_io=${TF_CLOUD_TOKEN}"
+                        sh "terraform plan -input=false -no-color -out=tfplan"
+                        sh "terraform show -no-color tfplan > tfplan.json"
+                    }
+                    archiveArtifacts artifacts: "${env.TF_DIR}/tfplan.json", onlyIfSuccessful: true
+                }
+            }
+        }
+        stage('Terraform Apply') {
+            when {
+                expression { params.ACTION == 'apply' }
+            }
+            steps {
+                withAWS(credentials: 'aws_creds') {
+                    dir("${env.TF_DIR}") {
+                        sh "export TF_TOKEN_app_terraform_io=${TF_CLOUD_TOKEN}"
+                        sh "terraform apply -no-color -auto-approve tfplan"
+                    }
+                }
+            }
+        }
+        stage('Terraform Destroy Plan') {
+            when {
+                expression { params.ACTION == 'destroy' }
+            }
+            steps {
+                withAWS(credentials: 'aws_creds') {
+                    dir("${env.TF_DIR}") {
+                        sh "export TF_TOKEN_app_terraform_io=${TF_CLOUD_TOKEN}"
+                        sh "terraform plan -no-color -destroy -out=tfplan-destroy"
+                        sh "terraform show -no-color tfplan-destroy > tfplan-destroy.json"
+                    }
+                }
+                archiveArtifacts artifacts: "${env.TF_DIR}/tfplan-destroy.json", onlyIfSuccessful: true
+            }
+        }
+        stage('Approve and Destroy') {
+            when {
+                expression { params.ACTION == 'destroy' }
+            }
+            steps {
+                timeout(time: 5, unit: 'MINUTES') {
+                    script {
+                        def userInput= input(
+                            id: 'confirmDestroy', message: 'Do you want to proceed with terraform destroy?', parameters: [
+                                [$class: 'BooleanParameterDefinition', defaultValue: false, description: '', name: 'confirm']
+                            ]
+                        )
+                        if (userInput == true) {
+                            withAWS(credentials: 'aws_creds') {
+                                dir("${env.TF_DIR}") {
+                                    sh "export TF_TOKEN_app_terraform_io=${TF_CLOUD_TOKEN}"
+                                    sh "terraform apply -no-color -auto-approve tfplan-destroy"
+                                    sh "rm -f tfplan-destroy tfplan-destroy.json"
+                                }
+                            }
+                        } else {
+                            error("Terraform destroy was not approved in the provided time limit")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            dir("${env.TF_DIR}") {
+                sh "rm -f tfplan tfplan.json"
+            }
+        }
+        success {
+            echo "Terraform ${params.ACTION} completed successfully on branch '${params.BRANCH}'."
+            echo "You can view the plan output in the archived tfplan.txt artifact."
+        }
+        failure {
+            echo "Terraform ${params.ACTION} failed."
+        }
+    }
+}
